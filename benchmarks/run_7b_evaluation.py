@@ -67,8 +67,13 @@ def run_evaluation():
         if device_count > 1:
             model_kwargs['max_memory'] = {i: "13GiB" for i in range(device_count)}
         if args.load_in_4bit:
-            model_kwargs['load_in_4bit'] = True
-            print("Enabling 4-bit quantization for weights (saves ~10 GB VRAM)...")
+            from transformers import BitsAndBytesConfig
+            model_kwargs['quantization_config'] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_quant_type="nf4"
+            )
+            print("Enabling 4-bit quantization via BitsAndBytesConfig (saves ~10 GB VRAM)...")
     else:
         print("Running on CPU...")
 
