@@ -38,7 +38,26 @@ Existing compression methods bypass this by simply **evicting tokens** (e.g., H2
 
 ## 📊 Benchmark Results
 
-### 🏆 Benchmark 1: End-to-End Generative Retrieval (Needle-In-A-Haystack, 2,533 Tokens, 39.6x Compression)
+### 🏆 Benchmark 1: Flagship 7B LLM Generative Retrieval (Qwen2.5-7B-Instruct, 3,919 Tokens, 32x Compression)
+
+Evaluated on **Qwen2.5-7B-Instruct** across **3,919 tokens** under strict equal-budget constraints (**128 tokens in cache, a 32.0x compression ratio**):
+
+```bash
+python benchmarks/run_7b_evaluation.py --model_id Qwen/Qwen2.5-7B-Instruct --context_len 4096 --budget 128
+```
+
+| Method | Cache Policy | Cache Budget | Generated Output | Retrieval Accuracy |
+| :--- | :--- | :---: | :---: | :---: |
+| **Exact Full Cache** | Ground Truth (Uncompressed) | 3,919 tokens | `' 849204.'` | **100% (Exact Ground Truth)** |
+| **StreamingLLM** | Sinks (4) + Sliding Window (124) | 128 tokens | `' 123456.'` | **0% (Hallucination)** |
+| **H2O Eviction** | Sinks (4) + Heavy Hitters (92) + Recent (32) | 128 tokens | `' 12345. \n\n'` | **0% (Hallucination)** |
+| **Windowed Dual-Space** | Unsupervised Anchors + De-RoPE Centroids (Ours) | **128 tokens** | `' 849204.'` | **100% (EXACT RECOVERY) 🏆** |
+
+> **Key Finding on 7B Scale:** While H2O and StreamingLLM completely lose the factual context and fabricate random digits (`' 123456.'`), Windowed Dual-Space at **32x compression** reproduces the exact ground-truth output of the full uncompressed 7B model.
+
+---
+
+### 🏆 Benchmark 2: Compact LLM Retrieval (Needle-In-A-Haystack, 2,533 Tokens, 39.6x Compression)
 
 Tested on **Qwen2.5-0.5B** on a long-context document of **2,533 tokens**. A confidential passkey (`849204`) was hidden at depth 49% in the text, followed by an end-of-document retrieval query. **All compressed caches were allocated strictly identical memory budgets (64 tokens / ~16.4 KB, a 39.6x compression ratio)**:
 

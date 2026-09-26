@@ -1,0 +1,22 @@
+{
+  "Exact Full Cache": {
+    "output": "' 849204.'",
+    "budget": 3919,
+    "acc": true
+  },
+  "StreamingLLM": {
+    "output": "' 123456.'",
+    "budget": 128,
+    "acc": false
+  },
+  "H2O Eviction": {
+    "output": "' 12345. \\n\\n'",
+    "budget": 128,
+    "acc": false
+  },
+  "Windowed Dual-Space": {
+    "output": "' 849204.'",
+    "budget": 128,
+    "acc": true
+  }
+}

@@ -31,6 +31,7 @@ def run_evaluation():
     parser.add_argument('--budget', type=int, default=128, help='Compressed cache budget in tokens')
     parser.add_argument('--load_in_4bit', action='store_true', help='Use 4-bit quantization for constrained VRAM')
     parser.add_argument('--needle', type=str, default='849204', help='Needle passkey digits')
+    parser.add_argument('--max_tokens', type=int, default=8, help='Number of tokens to generate')
     args = parser.parse_args()
 
     print("="*85)
@@ -104,6 +105,8 @@ def run_evaluation():
     haystack_part = filler * repeats
     if "mistral" in args.model_id.lower():
         full_text = f"[INST] {haystack_part + needle_sentence + haystack_part}\n\nWhat is the confidential server access passcode? [/INST] The confidential server access passcode is"
+    elif "llama" in args.model_id.lower():
+        full_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{haystack_part + needle_sentence + haystack_part}\n\nWhat is the confidential server access passcode?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nThe confidential server access passcode is"
     else:
         full_text = haystack_part + needle_sentence + "\n\n" + haystack_part + "\n\n" + query
 
@@ -141,7 +144,9 @@ def run_evaluation():
     mid_cands = list(range(sinks, seq_len - recent))
 
     # Helper function for token generation
-    def generate_tokens(cache, max_tokens=8):
+    def generate_tokens(cache, max_tokens=None):
+        if max_tokens is None:
+            max_tokens = args.max_tokens
         curr_in = input_ids[:, -1:]
         gen_ids = []
         for s in range(max_tokens):
