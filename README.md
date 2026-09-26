@@ -133,3 +133,19 @@ print(f"Exact memory used: {cache.get_memory_bytes()} bytes")
   year={2026}
 }
 ```
+
+### 3. Multi-Topic Document Coverage Benchmark (Same 5.0 KB Budget, 17x Compression)
+In a real document, queries target diverse factual entities across the context, not just static punctuation. When testing attention across 5 distinct topics in the document:
+
+| Query Topic | H2O (Eviction) | Windowed Dual-Space (Ours) | Advantage |
+| :--- | :---: | :---: | :---: |
+| **1940s Computer** | **0.9469** | 0.5600 | H2O (-38.7%) |
+| **Dartmouth Workshop (1956)** | 0.0598 | **0.4040** | **DUAL-SPACE 🏆 (+34.4%)** |
+| **Lighthill Report (1973)** | 0.1524 | **0.5600** | **DUAL-SPACE 🏆 (+40.8%)** |
+| **Machine Learning Era** | **0.9994** | 0.5996 | H2O (-40.0%) |
+| **Prompt Final Token** | 0.2090 | **0.9888** | **DUAL-SPACE 🏆 (+78.0%)** |
+| **OVERALL AVERAGE** | **0.4735** | **0.6225** | **DUAL-SPACE 🏆 (+14.90%)** |
+
+![Multi-Topic Document Coverage](paper/multitopic_document_coverage.png)
+
+*Key insight:* While H2O scores well when a query matches its few saved heavy hitters, it drops to catastrophic blindness ($0.0598$) whenever queried about other factual sections of the document that it evicted. Windowed Dual-Space maintains balanced context coverage, achieving a **+14.90% higher average cosine similarity** across the entire document.
