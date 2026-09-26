@@ -128,6 +128,23 @@ Evaluated on Qwen2.5-0.5B and SmolLM2-135M across equivalent memory budgets:
 * **H2O:** Needle retained = **False** (Evicted).
 * **Windowed Dual-Space:** Needle retained = **TRUE** (Preserved in centroid).
 
+### 5.3. Generative Retrieval on Flagship 7B and 8B Architectures
+Evaluated across $\sim 4{,}000$ tokens under strict cache budget parity ($B = 128$ tokens, corresponding to $\sim 31\times$--$32\times$ compression):
+
+| Model Architecture | Method | Cache Budget | Generated Output | Retrieval Accuracy |
+| :--- | :--- | :---: | :---: | :---: |
+| **Qwen2.5-7B-Instruct** | **Exact Full Cache** | 3,919 | `' 849204.'` | **100% (Ground Truth)** |
+| *(3,919 tokens, 32.0x comp.)* | **StreamingLLM** | 128 | `' 123456.'` | 0% (Hallucination) |
+| | **H2O Eviction** | 128 | `' 12345. \n\n'` | 0% (Hallucination) |
+| | **Windowed Dual-Space** | **128** | `' 849204.'` | **100% (Exact Match) 🏆** |
+| :--- | :--- | :---: | :---: | :---: |
+| **Meta-Llama-3.1-8B** | **Exact Full Cache** | 3,924 | `' 849204.<|eot_id|...'` | **100% (Ground Truth)** |
+| *(3,924 tokens, 30.7x comp.)* | **StreamingLLM** | 128 | `' 1234.<|eot_id|...'` | 0% (Hallucination) |
+| | **H2O Eviction** | 128 | `' 1234.<|eot_id|...'` | 0% (Hallucination) |
+| | **Windowed Dual-Space** | **128** | `' 849204.<|eot_id|...'` | **100% (Exact Match) 🏆** |
+
+> Across both Alibaba and Meta flagship architectures, eviction approaches (H2O, StreamingLLM) completely discard middle-context needle tokens, producing hallucinated digit sequences. Windowed Dual-Space reproduces 100% exact ground truth outputs under extreme $\sim 31\times$--$32\times$ compression.
+
 ---
 
 ## 6. Limitations and Future Work
