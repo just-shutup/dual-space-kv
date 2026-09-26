@@ -107,9 +107,17 @@ def run_evaluation():
         messages = [
             {"role": "user", "content": f"{haystack_part + needle_sentence + haystack_part}\n\nWhat is the confidential server access passcode?"}
         ]
-        prefix_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors='pt')
-        suffix_ids = tokenizer.encode("The confidential server access passcode is", add_special_tokens=False, return_tensors='pt')
-        input_ids = torch.cat([prefix_ids, suffix_ids], dim=-1)
+        prompt_res = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors='pt')
+        if hasattr(prompt_res, 'input_ids'):
+            prefix_tensor = prompt_res.input_ids
+        elif isinstance(prompt_res, dict):
+            prefix_tensor = prompt_res['input_ids']
+        else:
+            prefix_tensor = prompt_res
+
+        suffix_res = tokenizer("The confidential server access passcode is", add_special_tokens=False, return_tensors='pt')
+        suffix_tensor = suffix_res['input_ids'] if isinstance(suffix_res, dict) or hasattr(suffix_res, 'input_ids') else suffix_res
+        input_ids = torch.cat([prefix_tensor, suffix_tensor], dim=-1)
     elif "mistral" in args.model_id.lower():
         full_text = f"[INST] {haystack_part + needle_sentence + haystack_part}\n\nWhat is the confidential server access passcode? [/INST] The confidential server access passcode is"
         inputs = tokenizer(full_text, return_tensors='pt')
