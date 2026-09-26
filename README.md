@@ -32,15 +32,15 @@ Existing compression methods bypass this by simply **evicting tokens** (e.g., H2
 1. **Canonical De-RoPE:** Unrotates keys into position-invariant $U$-space ($u_t = R(-t) k_t$).
 2. **Window-Constrained Clustering:** Restricts clustering to local windows ($W \le 32$) with physical re-rotation ($\bar{k}_c = R(\bar{p}_c) \bar{u}_c$).
 3. **Exact Byte Accounting:** Consumes strictly **260 bytes per centroid** ($1.01\times$ of a vanilla FP16 token) with zero hidden dense covariance matrices.
-4. **Unsupervised Saliency Anchors:** Automatically protects rare factual entities using document inverse frequency, eliminating all dependence on artificial oracles.
+4. **Architectural Synergy (Anchors + De-RoPE Centroids):** Rare discrete facts (passkeys, dates, names) are preserved as exact anchors via unsupervised inverse frequency, while the dense 90% background context is compressed into position-aware centroids without phase cancellation.
 
 ---
 
 ## 📊 Benchmark Results
 
-### 🏆 Benchmark 1: End-to-End Generative Retrieval (Needle-In-A-Haystack, Strict Equal Budget)
+### 🏆 Benchmark 1: End-to-End Generative Retrieval (Needle-In-A-Haystack, 2,533 Tokens, 39.6x Compression)
 
-Tested on **Qwen2.5-0.5B** on a 513-token document. A confidential passkey (`849204`) was placed at depth 49% in the text, followed by an end-of-document retrieval query. **All compressed caches were allocated strictly identical memory budgets (57 tokens / ~14.6 KB)**:
+Tested on **Qwen2.5-0.5B** on a long-context document of **2,533 tokens**. A confidential passkey (`849204`) was hidden at depth 49% in the text, followed by an end-of-document retrieval query. **All compressed caches were allocated strictly identical memory budgets (64 tokens / ~16.4 KB, a 39.6x compression ratio)**:
 
 ```bash
 python benchmarks/test_generative_niah.py
@@ -48,12 +48,12 @@ python benchmarks/test_generative_niah.py
 
 | Method | Cache Policy | Cache Budget | Physical Memory | Generated Output | Accuracy |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| **Exact Full Cache** | Ground Truth (Uncompressed) | 513 tokens | 131.3 KB | `' 849'` | **100%** |
-| **StreamingLLM** | Sinks (4) + Sliding Window (53) | **57 tokens** | **14.6 KB** | `' not mentioned in the'` | **0% (Hallucination)** |
-| **H2O Eviction** | Sinks (4) + Heavy Hitters (37) + Recent (16) | **57 tokens** | **14.6 KB** | `' not mentioned in the'` | **0% (Hallucination)** |
-| **Windowed Dual-Space** | Unsupervised Anchors + Windowed Centroids (Ours) | **57 tokens** | **14.8 KB** | `' 849'` | **100% 🏆** |
+| **Exact Full Cache** | Ground Truth (Uncompressed) | 2,533 tokens | 648.4 KB | `' 849'` | **100%** |
+| **StreamingLLM** | Sinks (4) + Sliding Window (60) | **64 tokens** | **16.4 KB** | `' not mentioned in the'` | **0% (Hallucination)** |
+| **H2O Eviction** | Sinks (4) + Heavy Hitters (44) + Recent (16) | **64 tokens** | **16.4 KB** | `' not mentioned in the'` | **0% (Hallucination)** |
+| **Windowed Dual-Space** | Unsupervised Anchors + De-RoPE Centroids (Ours) | **64 tokens** | **16.6 KB** | `' 849'` | **100% 🏆** |
 
-> **Why H2O Hallucinates:** Token eviction algorithms rank tokens by cumulative attention during prompt prefill ($\sum_{t} \alpha_{t, i}$). Middle factual tokens receive near-zero attention during prefill (ranking in the bottom 10% of norms, below position 450/513) because repetitive filler words and initial attention sinks absorb 90%+ of prefill attention. Consequently, **H2O discards 100% of the passkey tokens**, causing the LLM to hallucinate that the passcode *"is not mentioned in the text"*. Dual-Space retains rare entities and compresses background context, preserving the exact passkey.
+> **Why H2O Hallucinates:** Token eviction algorithms rank tokens by cumulative attention during prompt prefill ($\sum_{t} \alpha_{t, i}$). Middle factual tokens receive near-zero attention during prefill (ranking in the bottom 10% of norms, below position 2,200/2,533) because repetitive filler words and initial attention sinks absorb 90%+ of prefill attention. Consequently, **H2O discards 100% of the passkey tokens**, causing the LLM to hallucinate that the passcode *"is not mentioned in the text"*. Dual-Space retains rare entities and compresses background context, preserving the exact passkey.
 
 ---
 
@@ -120,13 +120,18 @@ python benchmarks/run_honest_byte_benchmark.py
 
 ## ⚖️ Honest Engineering Trade-offs & Scientific Analysis
 
-### 1. Understanding the "SmolLM2 Paradox"
+### 1. The Synergy: Why Neither Anchors Alone nor Centroids Alone Suffice
+* **Anchors Alone (Pure Sparsity):** If one simply preserves the rare key tokens and evicts the remaining 90% background context, the model loses the surrounding semantic field ("confidential server access", "distributed architecture"). The question loses semantic grounding, and generative output degrades.
+* **Centroids Alone (Naive Merging):** If one averages the background keys in physical space without De-RoPE, RoPE phase interference collapses the centroid norms ($\|\bar{k}\| \to 0$). The background attention logits become severely distorted.
+* **The Dual-Space Synergy:** Unsupervised rarity anchors protect isolated high-entropy keys (10% budget), while Windowed Dual-Space centroids compress the dense 90% background without RoPE phase cancellation.
+
+### 2. Understanding the "SmolLM2 Paradox"
 Why does H2O score exceptionally high on SmolLM2-135M on static punctuation queries ($0.8562$ vs $0.5492$ at 86x)?
 * **Ultra-Sharp Attention Sinks in Small Llama Models:** In SmolLM2-135M, the beginning-of-sequence token (`<s>`) and initial punctuation act as massive attention sinks, absorbing over 85–90% of the entire softmax probability mass.
 * **The Single-Query Static Trap:** When evaluated against a single generic end-of-prompt punctuation query (e.g. `?`), keeping just 4 attention sink tokens accounts for 85%+ of the attention logit distribution.
 * **The Double-Edged Sword:** While this makes H2O look invincible on static punctuation tests, it creates the fatal vulnerability demonstrated in Benchmark 1: whenever a user actually asks a question about a middle fact, the model is completely blind because those non-sink tokens were deleted.
 
-### 2. Method Comparison Summary
+### 3. Method Comparison Summary
 
 | Criterion | H2O (Token Eviction) | Windowed Dual-Space (Ours) |
 | :--- | :--- | :--- |
