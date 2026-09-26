@@ -38,22 +38,33 @@ Existing compression methods bypass this by simply **evicting tokens** (e.g., H2
 
 ## 📊 Benchmark Results
 
-### 🏆 Benchmark 1: Flagship 7B LLM Generative Retrieval (Qwen2.5-7B-Instruct, 3,919 Tokens, 32x Compression)
+### 🏆 Benchmark 1: Flagship 7B/8B LLM Generative Retrieval (~4,000 Tokens, ~31x–32x Compression)
 
-Evaluated on **Qwen2.5-7B-Instruct** across **3,919 tokens** under strict equal-budget constraints (**128 tokens in cache, a 32.0x compression ratio**):
+Evaluated on two leading open-weights flagship architectures under strict equal-budget constraints (**128 tokens in cache**):
+- **Alibaba Qwen2.5-7B-Instruct** (3,919 tokens, 32.0x compression)
+- **Meta Llama-3.1-8B-Instruct** (3,924 tokens, 30.7x compression)
 
 ```bash
-python benchmarks/run_7b_evaluation.py --model_id Qwen/Qwen2.5-7B-Instruct --context_len 4096 --budget 128
+# Evaluate Qwen2.5-7B-Instruct
+python benchmarks/run_7b_evaluation.py --model_id Qwen/Qwen2.5-7B-Instruct --context_len 4096 --budget 128 --load_in_4bit
+
+# Evaluate Meta-Llama-3.1-8B-Instruct
+python benchmarks/run_7b_evaluation.py --model_id NousResearch/Meta-Llama-3.1-8B-Instruct --context_len 4096 --budget 128 --load_in_4bit
 ```
 
-| Method | Cache Policy | Cache Budget | Generated Output | Retrieval Accuracy |
-| :--- | :--- | :---: | :---: | :---: |
-| **Exact Full Cache** | Ground Truth (Uncompressed) | 3,919 tokens | `' 849204.'` | **100% (Exact Ground Truth)** |
-| **StreamingLLM** | Sinks (4) + Sliding Window (124) | 128 tokens | `' 123456.'` | **0% (Hallucination)** |
-| **H2O Eviction** | Sinks (4) + Heavy Hitters (92) + Recent (32) | 128 tokens | `' 12345. \n\n'` | **0% (Hallucination)** |
-| **Windowed Dual-Space** | Unsupervised Anchors + De-RoPE Centroids (Ours) | **128 tokens** | `' 849204.'` | **100% (EXACT RECOVERY) 🏆** |
+| Architecture | Method | Cache Policy | Cache Budget | Generated Output | Retrieval Accuracy |
+| :--- | :--- | :--- | :---: | :---: | :---: |
+| **Qwen2.5-7B-Instruct** | **Exact Full Cache** | Ground Truth (Uncompressed) | 3,919 tokens | `' 849204.'` | **100% (Exact Ground Truth)** |
+| *(3,919 tokens)* | **StreamingLLM** | Sinks (4) + Sliding Window (124) | 128 tokens | `' 123456.'` | **0% (Hallucination)** |
+| | **H2O Eviction** | Sinks (4) + Heavy Hitters (92) + Recent (32) | 128 tokens | `' 12345. \n\n'` | **0% (Hallucination)** |
+| | **Windowed Dual-Space** | Unsupervised Anchors + Centroids (Ours) | **128 tokens** | `' 849204.'` | **100% (EXACT RECOVERY) 🏆** |
+| :--- | :--- | :--- | :---: | :---: | :---: |
+| **Meta-Llama-3.1-8B** | **Exact Full Cache** | Ground Truth (Uncompressed) | 3,924 tokens | `' 849204.<|eot_id|...'` | **100% (Exact Ground Truth)** |
+| *(3,924 tokens)* | **StreamingLLM** | Sinks (4) + Sliding Window (124) | 128 tokens | `' 1234.<|eot_id|...'` | **0% (Hallucination)** |
+| | **H2O Eviction** | Sinks (4) + Heavy Hitters (92) + Recent (32) | 128 tokens | `' 1234.<|eot_id|...'` | **0% (Hallucination)** |
+| | **Windowed Dual-Space** | Unsupervised Anchors + Centroids (Ours) | **128 tokens** | `' 849204.<|eot_id|...'` | **100% (EXACT RECOVERY) 🏆** |
 
-> **Key Finding on 7B Scale:** While H2O and StreamingLLM completely lose the factual context and fabricate random digits (`' 123456.'`), Windowed Dual-Space at **32x compression** reproduces the exact ground-truth output of the full uncompressed 7B model.
+> **Key Finding Across 7B/8B Architectures:** On both Alibaba and Meta flagship architectures, H2O and StreamingLLM suffer from catastrophic context amnesia, hallucinating fabricated sequences (`' 123456.'`, `' 1234.'`). In contrast, Windowed Dual-Space at **~31x–32x compression** reproduces the exact ground-truth factual retrieval of uncompressed 7B/8B models with 100% accuracy.
 
 ---
 

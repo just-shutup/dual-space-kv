@@ -1,0 +1,22 @@
+{
+  "Exact Full Cache": {
+    "output": "' 849204.<|eot_id|><|start_header_id|>assistant<|end_header_id|>'",
+    "budget": 3924,
+    "acc": true
+  },
+  "StreamingLLM": {
+    "output": "' 1234.<|eot_id|><|start_header_id|>assistant<|end_header_id|>'",
+    "budget": 128,
+    "acc": false
+  },
+  "H2O Eviction": {
+    "output": "' 1234.<|eot_id|><|start_header_id|>assistant<|end_header_id|>'",
+    "budget": 128,
+    "acc": false
+  },
+  "Windowed Dual-Space": {
+    "output": "' 849204.<|eot_id|><|start_header_id|>assistant<|end_header_id|>'",
+    "budget": 128,
+    "acc": true
+  }
+}
