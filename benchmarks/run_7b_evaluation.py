@@ -45,6 +45,10 @@ def run_evaluation():
         for i in range(device_count):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB)")
 
+    if has_cuda:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        torch.cuda.empty_cache()
+
     dtype = torch.bfloat16 if has_cuda else torch.float32
 
     # Load tokenizer
@@ -52,22 +56,28 @@ def run_evaluation():
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
 
     # Model loading kwargs
+    # Use PyTorch native SDPA (Scaled Dot-Product Attention) to avoid quadratic O(N^2) memory spikes
+    attn_impl = 'sdpa' if has_cuda else 'eager'
     model_kwargs = {
-        'torch_dtype': dtype,
-        'attn_implementation': 'eager'
+        'dtype': dtype,
+        'attn_implementation': attn_impl
     }
     if has_cuda:
         model_kwargs['device_map'] = 'auto'
+        if device_count > 1:
+            model_kwargs['max_memory'] = {i: "13GiB" for i in range(device_count)}
         if args.load_in_4bit:
             model_kwargs['load_in_4bit'] = True
-            print("Enabling 4-bit quantization for weights...")
+            print("Enabling 4-bit quantization for weights (saves ~10 GB VRAM)...")
     else:
         print("Running on CPU...")
 
-    print(f"2. Loading model weights for {args.model_id}...")
+    print(f"2. Loading model weights for {args.model_id} (attention: {attn_impl})...")
     t_load = time.time()
     model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
     model.eval()
+    if has_cuda:
+        torch.cuda.empty_cache()
     print(f"Model loaded in {time.time() - t_load:.2f}s")
 
     # Construct prompt with hidden passkey
@@ -91,8 +101,9 @@ def run_evaluation():
 
     inputs = tokenizer(full_text, return_tensors='pt')
     if has_cuda and not args.load_in_4bit and 'device_map' not in model_kwargs:
-        inputs = {k: v.to('cuda') for k, v in inputs.items()}
     input_ids = inputs['input_ids']
+    if has_cuda:
+        input_ids = input_ids.to(model.device)
     seq_len = input_ids.shape[1]
     print(f"\nActual prompt length: {seq_len} tokens")
 
@@ -139,9 +150,7 @@ def run_evaluation():
     # 1. Exact Generation
     print("\n4. Evaluating Model Outputs...")
     print("  -> Generating with Exact Full Cache...")
-    with torch.no_grad():
-        out_ex = model.generate(input_ids, max_new_tokens=4, do_sample=False)
-    gen_exact = repr(tokenizer.decode(out_ex[0][seq_len:]))
+    gen_exact = generate_tokens(exact_cache)
     results['Exact Full Cache'] = {'output': gen_exact, 'budget': seq_len, 'acc': args.needle in gen_exact}
 
     # 2. StreamingLLM
