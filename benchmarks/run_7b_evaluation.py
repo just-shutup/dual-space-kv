@@ -103,15 +103,22 @@ def run_evaluation():
     repeats = max(1, target_filler_tokens // single_len)
 
     haystack_part = filler * repeats
-    if "mistral" in args.model_id.lower():
+    if "llama" in args.model_id.lower() and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+        messages = [
+            {"role": "user", "content": f"{haystack_part + needle_sentence + haystack_part}\n\nWhat is the confidential server access passcode?"}
+        ]
+        prefix_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors='pt')
+        suffix_ids = tokenizer.encode("The confidential server access passcode is", add_special_tokens=False, return_tensors='pt')
+        input_ids = torch.cat([prefix_ids, suffix_ids], dim=-1)
+    elif "mistral" in args.model_id.lower():
         full_text = f"[INST] {haystack_part + needle_sentence + haystack_part}\n\nWhat is the confidential server access passcode? [/INST] The confidential server access passcode is"
-    elif "llama" in args.model_id.lower():
-        full_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{haystack_part + needle_sentence + haystack_part}\n\nWhat is the confidential server access passcode?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nThe confidential server access passcode is"
+        inputs = tokenizer(full_text, return_tensors='pt')
+        input_ids = inputs['input_ids']
     else:
         full_text = haystack_part + needle_sentence + "\n\n" + haystack_part + "\n\n" + query
+        inputs = tokenizer(full_text, return_tensors='pt')
+        input_ids = inputs['input_ids']
 
-    inputs = tokenizer(full_text, return_tensors='pt')
-    input_ids = inputs['input_ids']
     if has_cuda:
         input_ids = input_ids.to(model.device)
     seq_len = input_ids.shape[1]
