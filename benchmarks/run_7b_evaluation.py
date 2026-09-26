@@ -100,7 +100,6 @@ def run_evaluation():
     full_text = haystack_part + needle_sentence + "\n\n" + haystack_part + "\n\n" + query
 
     inputs = tokenizer(full_text, return_tensors='pt')
-    if has_cuda and not args.load_in_4bit and 'device_map' not in model_kwargs:
     input_ids = inputs['input_ids']
     if has_cuda:
         input_ids = input_ids.to(model.device)
