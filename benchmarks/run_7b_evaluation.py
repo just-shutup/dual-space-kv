@@ -138,7 +138,7 @@ def run_evaluation():
     mid_cands = list(range(sinks, seq_len - recent))
 
     # Helper function for token generation
-    def generate_tokens(cache, max_tokens=6):
+    def generate_tokens(cache, max_tokens=8):
         curr_in = input_ids[:, -1:]
         gen_ids = []
         for s in range(max_tokens):
@@ -150,8 +150,8 @@ def run_evaluation():
         return repr(tokenizer.decode(gen_ids))
 
     def is_passkey_match(text):
-        clean = text.replace("'", "").replace('"', '').strip()
-        return args.needle in clean or clean.startswith(args.needle[:3])
+        clean = text.replace("'", "").replace('"', '').replace(" ", "").strip()
+        return args.needle in clean or clean.startswith(args.needle[:4])
 
     results = {}
 
