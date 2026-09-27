@@ -367,7 +367,7 @@ class DualSpaceKVCache(DynamicCache):
         """Provides correct mask sizing for attention mask generation."""
         if layer_idx >= len(self.dual_layers) or self.dual_layers[layer_idx].keys is None:
             return query_length, 0
-        kv_len = self.dual_layers[layer_idx].keys.shape[-2]
+        kv_len = self.dual_layers[layer_idx].keys.shape[-2] + query_length
         return kv_len, 0
 
     def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
