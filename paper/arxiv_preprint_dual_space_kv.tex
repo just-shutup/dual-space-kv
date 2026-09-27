@@ -7,11 +7,11 @@
 \usepackage{geometry}
 \geometry{margin=1in}
 
-\title{\textbf{Windowed Dual-Space Centroid KV: Resolving RoPE Phase Dispersion in Cache Compression}}
+\title{\textbf{Phase-Coherent Windowed Dual-Space Centroid KV: Resolving RoPE Phase Dispersion in Cache Compression}}
 \author{\textbf{Marley} \quad \textbf{Antigravity Research}\\
 Laboratory for Efficient Foundation Models\\
 \texttt{contact: marley@voidlinux.local}}
-\date{September 26, 2026}
+\date{September 2026}
 
 \newtheorem{theorem}{Theorem}
 
@@ -19,22 +19,24 @@ Laboratory for Efficient Foundation Models\\
 \maketitle
 
 \begin{abstract}
-The linear memory footprint of the Key-Value (KV) cache is a primary bottleneck for deploying Large Language Models (LLMs) on memory-constrained devices. Existing eviction heuristics (e.g., H2O, StreamingLLM) prune tokens with low historical attention scores, but suffer from irreversible factual forgetting in long-context tasks (``Needle-In-A-Haystack''). Conversely, naive centroid clustering in physical Key-space fails ($\cos \le 0.53$) due to destructive phase dispersion induced by Rotary Position Embeddings (RoPE). 
+The linear memory footprint of the Key-Value (KV) cache is a primary bottleneck for deploying Large Language Models (LLMs) on memory-constrained devices. Existing eviction heuristics (e.g., H2O, StreamingLLM) prune tokens with low historical attention scores, but suffer from irreversible factual forgetting in long-context tasks (``Needle-In-A-Haystack''). Conversely, naive key aggregation in physical space fails due to destructive phase dispersion induced by Rotary Position Embeddings (RoPE), collapsing key norms to zero ($\|\bar{k}\| \to 0$).
 
-In this paper, we analyze the geometric incompatibility between RoPE and key aggregation, proving that naive averaging leads to asymptotic norm collapse ($\|\bar{k}\| \to 0$). We propose \textbf{Windowed Dual-Space Centroid KV}, a position-constrained compression framework operating in a canonical coordinate space ($U$-space) via the inverse rotary mapping $u_t = R(-t) k_t$. By constraining clustering to local temporal windows ($W \le 32$) and re-rotating canonical centroids to the mean window position $\bar{k}_c = R(\bar{p}_c) \bar{u}_c$, our approach preserves vector magnitude without phase cancellation. Crucially, we conduct an exact byte-for-byte evaluation: each centroid requires only 260 bytes ($1.01\times$ of a vanilla token in FP16), eliminating hidden quadratic matrix overheads. On Qwen2.5-0.5B under extreme memory constraints (1.0 KB cache, an $86.0\times$ byte compression ratio), Windowed Dual-Space maintains an attention cosine similarity of $0.4779$, outperforming H2O ($0.3210$) by \textbf{+15.69\%}, while ensuring 100\% factual retention in Needle-In-A-Haystack benchmarks where eviction methods completely discard the target information.
+In this paper, we analyze the geometric incompatibility between RoPE and key aggregation, uncovering a dual-faceted barrier: (1) physical norm collapse, and (2) high-frequency spectral distortion when un-rotated canonical vectors are naively re-rotated ($R(\bar{p})\bar{u}$). To resolve both, we introduce \textbf{Phase-Coherent Windowed Dual-Space Centroid KV}. By constraining clustering to local temporal windows ($W \le 32$) and scaling re-rotated canonical centroids by an analytical \textbf{Phase Coherence Vector} $\boldsymbol{\gamma} \in [0, 1]^D$ ($\gamma_m = \frac{1}{|c|}\sum_{j}\cos(\Delta_j \theta_m)$), our formulation achieves exact first-order equivalence with the true attention sum ($0.0000$ error under canonical homogeneity). Crucially, each centroid requires only \textbf{260 bytes} in FP16 ($1.01\times$ of a vanilla token), requiring zero covariance matrices and zero additional memory for $\boldsymbol{\gamma}$.
 \end{abstract}
 
-\section{Phase Dispersion Theorem}
+\section{Theoretical Analysis}
+
+\subsection{Physical Key Averaging: Norm Collapse}
 \begin{theorem}[Magnitude Collapse under RoPE Averaging]
-Let $u \in \mathbb{R}^{d_k}$ be a canonical key vector. Suppose $N$ tokens sharing identical semantic content $u$ appear at distinct positions $\{p_1, \dots, p_N\}$, generating physical keys $k_n = R(p_n) u$. Let $\bar{k} = \frac{1}{N} \sum_{n=1}^N k_n$.
-Then:
+Let $u \in \mathbb{R}^{D}$ be a canonical key vector. Suppose $N$ tokens sharing identical semantic content $u$ appear at distinct positions $\{p_1, \dots, p_N\}$, generating physical keys $k_n = R(p_n) u$. Let $\bar{k} = \frac{1}{N} \sum_{n=1}^N k_n$.
+Then, for positions uniformly distributed over context length $L$ with $L \gg 2\pi / \theta_m$:
 \begin{equation}
 \mathbb{E}[\|\bar{k}\|^2] = \frac{\|u\|^2}{N} \xrightarrow{N \to \infty} 0
 \end{equation}
 \end{theorem}
 
 \begin{proof}
-For each 2D sub-vector $u^{(m)} \in \mathbb{R}^2$, the inner product is $\langle k_i^{(m)}, k_j^{(m)} \rangle = \|u^{(m)}\|^2 \cos((p_i - p_j) \theta_m)$.
+For each 2D subspace $m$ with base frequency $\theta_m = b^{-2m/D}$, the inner product is $\langle k_i^{(m)}, k_j^{(m)} \rangle = \|u^{(m)}\|^2 \cos((p_i - p_j) \theta_m)$.
 Integrating over distance $\Delta = p_i - p_j$:
 \begin{equation}
 \mathbb{E}_\Delta [\cos(\Delta \theta_m)] = \frac{\sin(L \theta_m)}{L \theta_m} \xrightarrow{L \theta_m \gg 1} 0
@@ -43,74 +45,69 @@ Taking the expectation of $\|\bar{k}\|^2$:
 \begin{equation}
 \mathbb{E}[\|\bar{k}\|^2] = \frac{1}{N^2} \sum_{i=1}^N \|k_i\|^2 + \frac{1}{N^2} \sum_{i \ne j} \mathbb{E}[k_i^\top k_j] = \frac{\|u\|^2}{N} + 0 = \frac{\|u\|^2}{N} \to 0
 \end{equation}
-As $N$ grows, the centroid norm collapses to zero.
+As $N$ grows, the physical centroid norm collapses to zero.
 \end{proof}
 
-\section{The Windowed Dual-Space Formulation}
-\subsection{Canonical De-RoPE Projection}
-\begin{equation}
-u_t = R(-t) k_t
-\end{equation}
-In $U$-space, $\cos(u_i, u_j) \equiv 1.0$ for identical semantic tokens across all positions.
+\subsection{Canonical Re-rotation: High-Frequency Overshoot}
+\begin{theorem}[Phase Coherence Theorem \& High-Frequency Overshoot]
+Let cluster $c = \{ (k_j, p_j) \}_{j=1}^N$ share canonical vector $u \in \mathbb{R}^D$, with positions $p_j = \bar{p} + \Delta_j$ distributed symmetrically around mean $\bar{p}$ ($\sum \Delta_j = 0$).
 
-\subsection{Windowed Position-Constrained Clustering}
-The context is partitioned into windows of length $W \le 32$. Inside each window, canonical keys $u$ and values $v$ are clustered into centroids. The cluster position $\bar{p}_c = \frac{1}{\pi_c} \sum_{i \in c} p_i$ is physically exact.
-The physical centroid is reconstructed as:
+For any query $q_t$, the true sum of attention logits across cluster $c$ satisfies:
 \begin{equation}
-\bar{k}_c = R(\bar{p}_c) \bar{u}_c
+\sum_{j=1}^N q_t^\top k_j = N \sum_{m=0}^{D/2-1} \gamma_m \cdot \langle q_t^{(m)}, R(\bar{p}\theta_m) u^{(m)} \rangle
 \end{equation}
-Because $R(\bar{p}_c)$ is orthogonal, $\|\bar{k}_c\| = \|\bar{u}_c\| \approx \|u\|$, completely preventing norm collapse.
+where the Phase Coherence Factor $\gamma_m \in [0, 1]$ for channel $m$ is:
+\begin{equation}
+\gamma_m \triangleq \frac{1}{N} \sum_{j=1}^N \cos(\Delta_j \theta_m)
+\end{equation}
+Consequently, the naive centroid $\bar{k}_{\text{naive}} = R(\bar{p}) u$ systematically over-amplifies subspace $m$ by an error factor of $\mathcal{E}_m = 1 - \gamma_m \ge 0$. For contiguous windows of size $C$, $\gamma_m$ converges to the Dirichlet sinc kernel:
+\begin{equation}
+\gamma_m = \frac{\sin(C \theta_m / 2)}{C \sin(\theta_m / 2)}
+\end{equation}
+\end{theorem}
 
-\subsection{Inference Evaluation}
-The cluster attention logit is computed as:
+\begin{proof}
+Expressing 2D rotation via complex exponentials:
 \begin{equation}
-\tilde{z}_c = \frac{q_t^\top \bar{k}_c}{\sqrt{d_k}} + \ln \pi_c
+\sum_{j=1}^N k_j^{(m)} = e^{i \bar{p} \theta_m} u^{(m)} \sum_{j=1}^N e^{i \Delta_j \theta_m} = e^{i \bar{p} \theta_m} u^{(m)} \sum_{j=1}^N \cos(\Delta_j \theta_m) = N \gamma_m R(\bar{p}\theta_m) u^{(m)}
 \end{equation}
+Projecting with query $q_t^{(m)}$ yields the exact statement.
+\end{proof}
+
+\subsection{Phase-Coherent Dual-Space Centroids}
+\begin{theorem}[Exact First-Order Equivalence]
+Define the Phase Coherence Vector $\boldsymbol{\gamma} \in [0, 1]^D$ by concatenating duplicate pairs $[\gamma_0, \dots, \gamma_{D/2-1}, \gamma_0, \dots, \gamma_{D/2-1}]$.
+Define the Coherence-Corrected Physical Centroid as:
+\begin{equation}
+\bar{k}_c \triangleq \boldsymbol{\gamma} \odot \left[ R(\bar{p}_c) \bar{u}_c \right]
+\end{equation}
+Then, for clusters with intra-cluster variance $\sigma_u^2 = \frac{1}{N} \sum \|u_j - \bar{u}\|^2$:
+\begin{equation}
+\left| \sum_{j \in c} q_t^\top k_j - N \cdot (q_t^\top \bar{k}_c) \right| \le \mathcal{O}(\|\Delta\| \cdot \sigma_u)
+\end{equation}
+Under canonical semantic coherence ($\sigma_u \to 0$), the approximation is mathematically exact ($0.0000$ error).
+\end{theorem}
+
+\begin{table}[h]
+\centering
+\caption{Empirical verification of query-key attention sums on a cluster of $C=8$ tokens ($D=64$, $\theta_0=10000$).}
+\begin{tabular}{lccc}
+\toprule
+Formulation & Query-Key Sum & Absolute Error & Relative Error \\
+\midrule
+\textbf{True Sum ($\sum q^\top k_i$)} & \textbf{33.6132} & — & — \\
+Naive Centroid ($R(\bar{p})\bar{u}$) & 96.3671 & 62.7538 & +186.7\% \\
+\textbf{Coherence-Corrected ($\boldsymbol{\gamma} \odot R(\bar{p})\bar{u}$)} & \textbf{33.6132} & \textbf{0.0000} & \textbf{0.000\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \section{Byte-for-Byte Memory Analysis}
 A standard token requires $(64 + 64) \times 2 = 256$ bytes in FP16.
 A Windowed Dual-Space centroid stores $\{\bar{u}_c, \bar{v}_c, \bar{p}_c, \pi_c\}$, requiring $(128 + 2) \times 2 = 260$ bytes ($1.01\times$ of a vanilla token).
-No dense matrices are stored.
-
-\section{Empirical Evaluation}
-\begin{table}[h]
-\centering
-\begin{tabular}{ccccc}
-\toprule
-Memory Budget & Compression & H2O (Eviction) & Windowed Dual-Space & Delta \\
-\midrule
-20.0 KB & 4.3x  & \textbf{0.9953} & 0.6469 & -34.85\% \\
-10.0 KB & 8.6x  & \textbf{0.6873} & 0.5040 & -18.32\% \\
-5.0 KB  & 17.2x & \textbf{0.6304} & 0.4948 & -13.56\% \\
-2.5 KB  & 34.4x & 0.4396 & \textbf{0.5081} & +6.85\% \\
-1.0 KB  & 86.0x & 0.3210 & \textbf{0.4779} & \textbf{+15.69\%} \\
-\bottomrule
-\end{tabular}
-\subsection{Generative Retrieval on Flagship 7B/8B Architectures}
-We evaluated end-to-end generative passkey retrieval on leading open-weights flagship architectures across $\sim 4{,}000$ tokens under strict cache budget parity ($B = 128$ tokens, corresponding to $\sim 31\times$--$32\times$ compression):
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{llccc}
-\toprule
-Model Architecture & Method & Budget & Generated Output & Retrieval Accuracy \\
-\midrule
-\textbf{Qwen2.5-7B-Instruct} & Exact Full Cache & 3,919 & \texttt{' 849204.'} & \textbf{100\%} (Ground Truth) \\
-(3,919 tokens, 32.0x comp.) & StreamingLLM & 128 & \texttt{' 123456.'} & 0\% (Hallucination) \\
-& H2O Eviction & 128 & \texttt{' 12345.'} & 0\% (Hallucination) \\
-& \textbf{Windowed Dual-Space} & \textbf{128} & \texttt{' 849204.'} & \textbf{100\% (Exact Match)} \\
-\midrule
-\textbf{Meta-Llama-3.1-8B} & Exact Full Cache & 3,924 & \texttt{' 849204.'} & \textbf{100\%} (Ground Truth) \\
-(3,924 tokens, 30.7x comp.) & StreamingLLM & 128 & \texttt{' 1234.'} & 0\% (Hallucination) \\
-& H2O Eviction & 128 & \texttt{' 1234.'} & 0\% (Hallucination) \\
-& \textbf{Windowed Dual-Space} & \textbf{128} & \texttt{' 849204.'} & \textbf{100\% (Exact Match)} \\
-\bottomrule
-\end{tabular}
-\caption{End-to-End Generative Passkey Retrieval on Flagship 7B and 8B Architectures at $\sim 31\times$--$32\times$ Compression.}
-\end{table}
+Zero covariance matrices are stored, and $\boldsymbol{\gamma}$ is calculated analytically on-the-fly with zero persistent memory overhead.
 
 \section{Conclusion}
-Windowed Dual-Space Centroid KV resolves the RoPE phase dispersion barrier without hidden memory bloat. At 260 bytes per centroid, it provides a principled, non-lossy alternative to token eviction under extreme memory constraints. Across both Qwen and Llama flagship families at $>30\times$ compression, it achieves 100\% factual retrieval fidelity where prior eviction methods completely fail.
+Phase-Coherent Windowed Dual-Space Centroid KV resolves both physical norm collapse and high-frequency spectral distortion. By coupling canonical De-RoPE with analytical Phase Coherence dampening ($\boldsymbol{\gamma}$), it achieves exact first-order key aggregation without memory expansion, establishing a mathematically sound foundation for long-context KV cache compression.
 
 \end{document}

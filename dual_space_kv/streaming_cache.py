@@ -75,6 +75,27 @@ class DualSpaceCacheLayer:
         self.recent_k: Optional[torch.Tensor] = None
         self.recent_v: Optional[torch.Tensor] = None
 
+    def _get_coherence_factor(
+        self,
+        positions: torch.Tensor,
+        mean_pos: torch.Tensor,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Computes the RoPE Phase Coherence Vector gamma in [0, 1]^D.
+        Eliminates high-frequency amplitude distortion under windowed key aggregation:
+        gamma_m = 1/|c| sum_{j in c} cos((p_j - p_bar) * theta_m).
+        """
+        if len(positions) <= 1:
+            return torch.ones(1, 1, 1, head_dim, device=device, dtype=dtype)
+        delta = (positions.float() - mean_pos).to(device=device, dtype=torch.float32)
+        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+        angles = torch.outer(delta, inv_freq)
+        gamma_half = angles.cos().mean(dim=0).to(dtype=dtype)
+        return torch.cat([gamma_half, gamma_half], dim=-1).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
     def _compress_window_chunk(
         self,
         w_u: torch.Tensor,
@@ -84,7 +105,10 @@ class DualSpaceCacheLayer:
         device: torch.device,
         dtype: torch.dtype
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Uniform contiguous chunking within window with physical RoPE re-rotation."""
+        """
+        Uniform contiguous chunking within window with Phase-Coherent RoPE re-rotation.
+        Applies analytical spectral dampening gamma to eliminate high-frequency distortion.
+        """
         w_len = w_u.shape[-2]
         k_centroids = max(1, w_len // self.target_compression)
         chunk_size = (w_len + k_centroids - 1) // k_centroids
@@ -95,12 +119,14 @@ class DualSpaceCacheLayer:
             c_e = min(w_len, (c + 1) * chunk_size)
             if c_s >= c_e:
                 continue
+            c_pos = w_pos[c_s:c_e]
+            c_p = c_pos.float().mean()
             c_u = w_u[:, :, c_s:c_e, :].mean(dim=-2, keepdim=True)
             c_v = w_v[:, :, c_s:c_e, :].mean(dim=-2, keepdim=True)
-            c_p = w_pos[c_s:c_e].float().mean()
 
             cos_c, sin_c = compute_rope_cos_sin(c_p.unsqueeze(0), head_dim, self.rope_theta, device, dtype)
-            c_k = apply_rope(c_u, cos_c, sin_c)
+            gamma = self._get_coherence_factor(c_pos, c_p, head_dim, device, dtype)
+            c_k = gamma * apply_rope(c_u, cos_c, sin_c)
             c_k_list.append(c_k)
             c_v_list.append(c_v)
 
