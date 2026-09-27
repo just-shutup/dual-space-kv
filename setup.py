@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="dual-space-kv",
-    version="3.5.0",
-    description="RoPE-Decoupled Streaming KV Cache Compression with First-Order Value Taylor Correction",
+    version="4.0.0",
+    description="Windowed Dual-Space Centroid KV: Position-Constrained RoPE-Decoupled Cache Compression",
     author="Marley & Antigravity Research",
     packages=find_packages(),
     install_requires=[

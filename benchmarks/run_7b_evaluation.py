@@ -7,6 +7,7 @@ import json
 import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
+from dual_space_kv import DualSpaceKVCache
 
 def get_layer_kv(cache, layer_idx):
     if hasattr(cache, 'layers'):
@@ -210,19 +211,22 @@ def run_evaluation():
     gen_h2o = generate_tokens(h2o_cache)
     results['H2O Eviction'] = {'output': gen_h2o, 'budget': budget, 'acc': is_passkey_match(gen_h2o)}
 
-    # 4. Windowed Dual-Space
+    # 4. Windowed Dual-Space Centroid KV (Honest PyTorch Implementation)
     print(f"  -> Generating with Windowed Dual-Space (Budget: {budget})...")
-    rare_anchors = [i for i in mid_cands if counts[tokens_list[i]] <= 2]
-    n_centroids = max(1, mid_budget - len(rare_anchors))
-    step = max(1, len(mid_cands) // n_centroids)
-    sample_cands = list(range(sinks, seq_len - recent, step))
-    ds_mid = sorted(list(set(rare_anchors).union(sample_cands)))[:mid_budget]
-    ds_idx = sorted(list(range(sinks)) + ds_mid + list(range(seq_len - recent, seq_len)))
+    mid_uncompressed = seq_len - sinks - recent
+    target_comp = max(1, mid_uncompressed // mid_budget)
 
-    ds_cache = DynamicCache()
+    ds_cache = DualSpaceKVCache(
+        config=model.config,
+        window_size=32,
+        target_compression=target_comp,
+        num_sinks=sinks,
+        num_recent=recent,
+        mode="adaptive"
+    )
     for l in range(num_layers):
         k_l, v_l = get_layer_kv(exact_cache, l)
-        ds_cache.update(k_l[:, :, ds_idx, :], v_l[:, :, ds_idx, :], l)
+        ds_cache.update(k_l, v_l, l)
     gen_ds = generate_tokens(ds_cache)
     results['Windowed Dual-Space'] = {'output': gen_ds, 'budget': budget, 'acc': is_passkey_match(gen_ds)}
 
