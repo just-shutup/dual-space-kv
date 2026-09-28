@@ -11,6 +11,9 @@ setup(
         "numpy>=1.22.0",
         "transformers>=4.40.0"
     ],
+    extras_require={
+        "triton": ["triton>=2.1.0"],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
