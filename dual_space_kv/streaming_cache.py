@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List, Union
 from transformers.cache_utils import DynamicCache, Cache
+try:
+    from transformers.cache_utils import CacheLayerMixin
+except ImportError:
+    class CacheLayerMixin:
+        pass
 from transformers.configuration_utils import PreTrainedConfig
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -38,7 +43,7 @@ def compute_rope_cos_sin(
     return cos, sin
 
 
-class DualSpaceCacheLayer:
+class DualSpaceCacheLayer(CacheLayerMixin):
     """
     State manager for a single Transformer layer within Windowed Dual-Space Centroid KV.
     Operates strictly in PyTorch tensors on GPU/CPU without host-device synchronization.
@@ -373,6 +378,20 @@ class DualSpaceCacheLayer:
         """Returns current physical count of cached key vectors."""
         return self.keys.shape[-2] if self.keys is not None else 0
 
+    def get_max_length(self) -> int:
+        """Returns maximum sequence length."""
+        return self.get_seq_length()
+
+    def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
+        """Returns (kv_length, kv_offset) for attention mask generation."""
+        if self.keys is None:
+            return query_length, 0
+        kv_len = self.keys.shape[-2] + query_length
+        return kv_len, 0
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        pass
+
 
 class DualSpaceKVCache(DynamicCache):
     """
@@ -413,6 +432,221 @@ class DualSpaceKVCache(DynamicCache):
             self.rope_theta = 10000.0
 
         self.dual_layers: List[DualSpaceCacheLayer] = []
+        self.prefill_keys: List[Optional[torch.Tensor]] = []
+        self.prefill_values: List[Optional[torch.Tensor]] = []
+        self.is_prefill_compressed: bool = False
+
+    def _compress_all_prefill_layers(self):
+        """
+        Executes cross-layer synchronized compression on all accumulated prefill KV states.
+        Enforces identical slot-to-position mapping across all layers to prevent
+        cross-layer token permutation and misalignment.
+        """
+        if self.is_prefill_compressed or len(self.prefill_keys) == 0:
+            self.is_prefill_compressed = True
+            return
+
+        # Filter active layers
+        active_layers = [k for k in self.prefill_keys if k is not None]
+        if len(active_layers) == 0:
+            self.is_prefill_compressed = True
+            return
+
+        num_layers = len(active_layers)
+        k0 = active_layers[0]
+        B, H, seq_len, D = k0.shape
+        device = k0.device
+        dtype = k0.dtype
+
+        if seq_len <= (self.num_sinks + self.num_recent + self.window_size):
+            for l in range(num_layers):
+                self.dual_layers[l].keys = self.prefill_keys[l]
+                self.dual_layers[l].values = self.prefill_values[l]
+            self.prefill_keys.clear()
+            self.prefill_values.clear()
+            self.is_prefill_compressed = True
+            return
+
+        mid_start = self.num_sinks
+        mid_end = seq_len - self.num_recent
+        M = mid_end - mid_start
+        mid_pos = torch.arange(mid_start, mid_end, device=device)
+        cos_mid, sin_mid = compute_rope_cos_sin(mid_pos, D, self.rope_theta, device, dtype)
+
+        k_budget = max(1, M // self.target_compression)
+        if k_budget >= M:
+            for l in range(num_layers):
+                self.dual_layers[l].keys = self.prefill_keys[l]
+                self.dual_layers[l].values = self.prefill_values[l]
+            self.prefill_keys.clear()
+            self.prefill_values.clear()
+            self.is_prefill_compressed = True
+            return
+
+        if self.mode == "adaptive":
+            num_anchors = max(1, int(k_budget * self.salience_ratio))
+            num_centroids = max(1, k_budget - num_anchors)
+
+            # Evaluate salience on representative middle layer
+            mid_layer_idx = num_layers // 2
+            mid_k_eval = self.prefill_keys[mid_layer_idx][:, :, mid_start:mid_end, :]
+            u_eval = inverse_rope(mid_k_eval, cos_mid, sin_mid)
+
+            num_windows = (M + self.window_size - 1) // self.window_size
+            salience = torch.zeros(M, device=device, dtype=torch.float32)
+            for w in range(num_windows):
+                ws = w * self.window_size
+                we = min(M, (w + 1) * self.window_size)
+                wu = u_eval[:, :, ws:we, :]
+                u_n = wu / (wu.norm(dim=-1, keepdim=True) + 1e-8)
+                sim = torch.matmul(u_n, u_n.transpose(-1, -2))
+                sal = -sim.mean(dim=-1).mean(dim=1)[0]
+                salience[ws:we] = sal
+
+            # Synchronized anchor indices and background chunks across ALL layers
+            anchor_local_idx = torch.topk(salience, k=num_anchors).indices.sort().values
+            anchor_set = set(anchor_local_idx.tolist())
+            bg_local_idx = torch.tensor([i for i in range(M) if i not in anchor_set], device=device, dtype=torch.long)
+            splits = torch.linspace(0, len(bg_local_idx), steps=num_centroids + 1, device=device).long()
+
+            for l in range(num_layers):
+                layer = self.dual_layers[l]
+                kl = self.prefill_keys[l]
+                vl = self.prefill_values[l]
+
+                layer.sinks_k = kl[:, :, :self.num_sinks, :]
+                layer.sinks_v = vl[:, :, :self.num_sinks, :]
+                layer.recent_k = kl[:, :, mid_end:, :]
+                layer.recent_v = vl[:, :, mid_end:, :]
+
+                k_mid = kl[:, :, mid_start:mid_end, :]
+                v_mid = vl[:, :, mid_start:mid_end, :]
+                u_mid = inverse_rope(k_mid, cos_mid, sin_mid)
+
+                ak = k_mid[:, :, anchor_local_idx, :]
+                av = v_mid[:, :, anchor_local_idx, :]
+                anchors_pos = mid_pos[anchor_local_idx].float()
+
+                ck_list, cv_list, cp_list = [], [], []
+                for i in range(num_centroids):
+                    s_idx = splits[i]
+                    e_idx = splits[i+1]
+                    if e_idx <= s_idx:
+                        continue
+                    chunk = bg_local_idx[s_idx:e_idx]
+                    c_u = u_mid[:, :, chunk, :]
+                    c_v = v_mid[:, :, chunk, :]
+                    c_pos = mid_pos[chunk].float()
+
+                    u_bar = c_u.mean(dim=-2, keepdim=True)
+                    v_bar = c_v.mean(dim=-2, keepdim=True)
+                    p_bar = c_pos.mean()
+
+                    cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, device, dtype)
+                    k_canon = apply_rope(u_bar, cos_p, sin_p)
+                    gamma = layer._get_coherence_factor(c_pos, p_bar, D, device, dtype)
+                    k_bar = gamma * k_canon
+
+                    ck_list.append(k_bar)
+                    cv_list.append(v_bar)
+                    cp_list.append(p_bar)
+
+                if len(ck_list) > 0:
+                    cent_k = torch.cat(ck_list, dim=-2)
+                    cent_v = torch.cat(cv_list, dim=-2)
+                    cent_pos = torch.stack(cp_list)
+
+                    all_mid_k = torch.cat([ak, cent_k], dim=-2)
+                    all_mid_v = torch.cat([av, cent_v], dim=-2)
+                    all_pos = torch.cat([anchors_pos, cent_pos])
+                    perm = torch.argsort(all_pos)
+
+                    layer.centroids_k = all_mid_k[:, :, perm, :]
+                    layer.centroids_v = all_mid_v[:, :, perm, :]
+                else:
+                    layer.centroids_k = ak
+                    layer.centroids_v = av
+
+                layer.keys = torch.cat([layer.sinks_k, layer.centroids_k, layer.recent_k], dim=-2)
+                layer.values = torch.cat([layer.sinks_v, layer.centroids_v, layer.recent_v], dim=-2)
+        else:
+            # Uniform mode
+            splits = torch.linspace(0, M, steps=k_budget + 1, device=device).long()
+            for l in range(num_layers):
+                layer = self.dual_layers[l]
+                kl = self.prefill_keys[l]
+                vl = self.prefill_values[l]
+
+                layer.sinks_k = kl[:, :, :self.num_sinks, :]
+                layer.sinks_v = vl[:, :, :self.num_sinks, :]
+                layer.recent_k = kl[:, :, mid_end:, :]
+                layer.recent_v = vl[:, :, mid_end:, :]
+
+                k_mid = kl[:, :, mid_start:mid_end, :]
+                v_mid = vl[:, :, mid_start:mid_end, :]
+                u_mid = inverse_rope(k_mid, cos_mid, sin_mid)
+
+                ck_list, cv_list = [], []
+                for i in range(k_budget):
+                    s_idx = splits[i]
+                    e_idx = splits[i+1]
+                    if e_idx <= s_idx:
+                        continue
+                    idx_chunk = torch.arange(s_idx, e_idx, device=device)
+                    c_u = u_mid[:, :, idx_chunk, :]
+                    c_v = v_mid[:, :, idx_chunk, :]
+                    c_pos = mid_pos[idx_chunk].float()
+
+                    u_bar = c_u.mean(dim=-2, keepdim=True)
+                    v_bar = c_v.mean(dim=-2, keepdim=True)
+                    p_bar = c_pos.mean()
+
+                    cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, device, dtype)
+                    k_canon = apply_rope(u_bar, cos_p, sin_p)
+                    gamma = layer._get_coherence_factor(c_pos, p_bar, D, device, dtype)
+                    k_bar = gamma * k_canon
+
+                    ck_list.append(k_bar)
+                    cv_list.append(v_bar)
+
+                layer.centroids_k = torch.cat(ck_list, dim=-2)
+                layer.centroids_v = torch.cat(cv_list, dim=-2)
+                layer.keys = torch.cat([layer.sinks_k, layer.centroids_k, layer.recent_k], dim=-2)
+                layer.values = torch.cat([layer.sinks_v, layer.centroids_v, layer.recent_v], dim=-2)
+
+        self.prefill_keys.clear()
+        self.prefill_values.clear()
+        self.is_prefill_compressed = True
+
+    @property
+    def layers(self):
+        if not self.is_prefill_compressed:
+            self._compress_all_prefill_layers()
+        return self.dual_layers
+
+    @layers.setter
+    def layers(self, value):
+        self.dual_layers = value
+
+    @property
+    def key_cache(self):
+        if not self.is_prefill_compressed:
+            self._compress_all_prefill_layers()
+        return [l.keys for l in self.dual_layers if l.keys is not None]
+
+    @key_cache.setter
+    def key_cache(self, value):
+        pass
+
+    @property
+    def value_cache(self):
+        if not self.is_prefill_compressed:
+            self._compress_all_prefill_layers()
+        return [l.values for l in self.dual_layers if l.values is not None]
+
+    @value_cache.setter
+    def value_cache(self, value):
+        pass
 
     def update(
         self,
@@ -436,6 +670,22 @@ class DualSpaceKVCache(DynamicCache):
                     salience_ratio=self.salience_ratio
                 )
             )
+
+        seq_len = key_states.shape[-2]
+        if not self.is_prefill_compressed:
+            if seq_len > 1:
+                # Accumulate prefill layers
+                while len(self.prefill_keys) <= layer_idx:
+                    self.prefill_keys.append(None)
+                    self.prefill_values.append(None)
+                self.prefill_keys[layer_idx] = key_states
+                self.prefill_values[layer_idx] = value_states
+                self.dual_layers[layer_idx].cumulative_length += seq_len
+                return key_states, value_states
+            else:
+                # First decode step: trigger synchronized cross-layer compression
+                self._compress_all_prefill_layers()
+
         return self.dual_layers[layer_idx].update(key_states, value_states)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
@@ -449,6 +699,8 @@ class DualSpaceKVCache(DynamicCache):
 
     def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> Tuple[int, int]:
         """Provides correct mask sizing for attention mask generation."""
+        if not self.is_prefill_compressed:
+            self._compress_all_prefill_layers()
         if layer_idx >= len(self.dual_layers) or self.dual_layers[layer_idx].keys is None:
             return query_length, 0
         kv_len = self.dual_layers[layer_idx].keys.shape[-2] + query_length
@@ -456,12 +708,16 @@ class DualSpaceKVCache(DynamicCache):
 
     def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Backward-compatible indexing `cache[layer_idx]`."""
+        if not self.is_prefill_compressed:
+            self._compress_all_prefill_layers()
         if layer_idx < len(self.dual_layers) and self.dual_layers[layer_idx].keys is not None:
             return self.dual_layers[layer_idx].keys, self.dual_layers[layer_idx].values
         raise IndexError(f"Layer index {layer_idx} out of range or not initialized.")
 
     def get_memory_bytes(self, bytes_per_element: int = 2) -> int:
         """Calculates exact physical memory footprint of stored keys and values in bytes."""
+        if not self.is_prefill_compressed:
+            self._compress_all_prefill_layers()
         total_elements = 0
         for l in self.dual_layers:
             if l.keys is not None:
