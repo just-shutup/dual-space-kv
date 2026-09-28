@@ -382,6 +382,10 @@ class DualSpaceCacheLayer(CacheLayerMixin):
         """Returns maximum sequence length."""
         return self.get_seq_length()
 
+    def get_max_cache_shape(self) -> int:
+        """Compatibility for transformers where get_max_cache_shape is an abstract method."""
+        return self.get_max_length()
+
     def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
         """Returns (kv_length, kv_offset) for attention mask generation."""
         if self.keys is None:
@@ -696,6 +700,9 @@ class DualSpaceKVCache(DynamicCache):
 
     def get_max_length(self, layer_idx: int = 0) -> int:
         return self.get_seq_length(layer_idx)
+
+    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+        return self.get_max_length(layer_idx)
 
     def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> Tuple[int, int]:
         """Provides correct mask sizing for attention mask generation."""
