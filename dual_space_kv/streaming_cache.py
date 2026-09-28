@@ -459,8 +459,6 @@ class DualSpaceKVCache(DynamicCache):
         num_layers = len(active_layers)
         k0 = active_layers[0]
         B, H, seq_len, D = k0.shape
-        device = k0.device
-        dtype = k0.dtype
 
         if seq_len <= (self.num_sinks + self.num_recent + self.window_size):
             for l in range(num_layers):
@@ -474,8 +472,6 @@ class DualSpaceKVCache(DynamicCache):
         mid_start = self.num_sinks
         mid_end = seq_len - self.num_recent
         M = mid_end - mid_start
-        mid_pos = torch.arange(mid_start, mid_end, device=device)
-        cos_mid, sin_mid = compute_rope_cos_sin(mid_pos, D, self.rope_theta, device, dtype)
 
         k_budget = max(1, M // self.target_compression)
         if k_budget >= M:
@@ -491,13 +487,19 @@ class DualSpaceKVCache(DynamicCache):
             num_anchors = max(1, int(k_budget * self.salience_ratio))
             num_centroids = max(1, k_budget - num_anchors)
 
-            # Evaluate salience on representative middle layer
+            # Evaluate salience on representative middle layer (strictly on its own device)
             mid_layer_idx = num_layers // 2
-            mid_k_eval = self.prefill_keys[mid_layer_idx][:, :, mid_start:mid_end, :]
-            u_eval = inverse_rope(mid_k_eval, cos_mid, sin_mid)
+            k_mid_eval_layer = self.prefill_keys[mid_layer_idx]
+            mid_dev = k_mid_eval_layer.device
+            mid_dtype = k_mid_eval_layer.dtype
+
+            mid_pos_eval = torch.arange(mid_start, mid_end, device=mid_dev)
+            cos_mid_eval, sin_mid_eval = compute_rope_cos_sin(mid_pos_eval, D, self.rope_theta, mid_dev, mid_dtype)
+            mid_k_eval = k_mid_eval_layer[:, :, mid_start:mid_end, :]
+            u_eval = inverse_rope(mid_k_eval, cos_mid_eval, sin_mid_eval)
 
             num_windows = (M + self.window_size - 1) // self.window_size
-            salience = torch.zeros(M, device=device, dtype=torch.float32)
+            salience = torch.zeros(M, device=mid_dev, dtype=torch.float32)
             for w in range(num_windows):
                 ws = w * self.window_size
                 we = min(M, (w + 1) * self.window_size)
@@ -507,16 +509,18 @@ class DualSpaceKVCache(DynamicCache):
                 sal = -sim.mean(dim=-1).mean(dim=1)[0]
                 salience[ws:we] = sal
 
-            # Synchronized anchor indices and background chunks across ALL layers
-            anchor_local_idx = torch.topk(salience, k=num_anchors).indices.sort().values
-            anchor_set = set(anchor_local_idx.tolist())
-            bg_local_idx = torch.tensor([i for i in range(M) if i not in anchor_set], device=device, dtype=torch.long)
-            splits = torch.linspace(0, len(bg_local_idx), steps=num_centroids + 1, device=device).long()
+            # Synchronized anchor indices and background splits (kept on CPU for multi-GPU layer dispatch)
+            anchor_local_idx_cpu = torch.topk(salience.cpu(), k=num_anchors).indices.sort().values
+            anchor_set = set(anchor_local_idx_cpu.tolist())
+            bg_local_idx_cpu = torch.tensor([i for i in range(M) if i not in anchor_set], dtype=torch.long)
+            splits_cpu = torch.linspace(0, len(bg_local_idx_cpu), steps=num_centroids + 1).long()
 
             for l in range(num_layers):
                 layer = self.dual_layers[l]
                 kl = self.prefill_keys[l]
                 vl = self.prefill_values[l]
+                dev_l = kl.device
+                dtype_l = kl.dtype
 
                 layer.sinks_k = kl[:, :, :self.num_sinks, :]
                 layer.sinks_v = vl[:, :, :self.num_sinks, :]
@@ -525,30 +529,36 @@ class DualSpaceKVCache(DynamicCache):
 
                 k_mid = kl[:, :, mid_start:mid_end, :]
                 v_mid = vl[:, :, mid_start:mid_end, :]
-                u_mid = inverse_rope(k_mid, cos_mid, sin_mid)
 
-                ak = k_mid[:, :, anchor_local_idx, :]
-                av = v_mid[:, :, anchor_local_idx, :]
-                anchors_pos = mid_pos[anchor_local_idx].float()
+                mid_pos_l = torch.arange(mid_start, mid_end, device=dev_l)
+                cos_mid_l, sin_mid_l = compute_rope_cos_sin(mid_pos_l, D, self.rope_theta, dev_l, dtype_l)
+                u_mid = inverse_rope(k_mid, cos_mid_l, sin_mid_l)
+
+                ak_idx = anchor_local_idx_cpu.to(dev_l)
+                bg_idx = bg_local_idx_cpu.to(dev_l)
+
+                ak = k_mid[:, :, ak_idx, :]
+                av = v_mid[:, :, ak_idx, :]
+                anchors_pos = mid_pos_l[ak_idx].float()
 
                 ck_list, cv_list, cp_list = [], [], []
                 for i in range(num_centroids):
-                    s_idx = splits[i]
-                    e_idx = splits[i+1]
+                    s_idx = splits_cpu[i].item()
+                    e_idx = splits_cpu[i+1].item()
                     if e_idx <= s_idx:
                         continue
-                    chunk = bg_local_idx[s_idx:e_idx]
+                    chunk = bg_idx[s_idx:e_idx]
                     c_u = u_mid[:, :, chunk, :]
                     c_v = v_mid[:, :, chunk, :]
-                    c_pos = mid_pos[chunk].float()
+                    c_pos = mid_pos_l[chunk].float()
 
                     u_bar = c_u.mean(dim=-2, keepdim=True)
                     v_bar = c_v.mean(dim=-2, keepdim=True)
                     p_bar = c_pos.mean()
 
-                    cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, device, dtype)
+                    cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, dev_l, dtype_l)
                     k_canon = apply_rope(u_bar, cos_p, sin_p)
-                    gamma = layer._get_coherence_factor(c_pos, p_bar, D, device, dtype)
+                    gamma = layer._get_coherence_factor(c_pos, p_bar, D, dev_l, dtype_l)
                     k_bar = gamma * k_canon
 
                     ck_list.append(k_bar)
@@ -575,11 +585,13 @@ class DualSpaceKVCache(DynamicCache):
                 layer.values = torch.cat([layer.sinks_v, layer.centroids_v, layer.recent_v], dim=-2)
         else:
             # Uniform mode
-            splits = torch.linspace(0, M, steps=k_budget + 1, device=device).long()
+            splits_cpu = torch.linspace(0, M, steps=k_budget + 1).long()
             for l in range(num_layers):
                 layer = self.dual_layers[l]
                 kl = self.prefill_keys[l]
                 vl = self.prefill_values[l]
+                dev_l = kl.device
+                dtype_l = kl.dtype
 
                 layer.sinks_k = kl[:, :, :self.num_sinks, :]
                 layer.sinks_v = vl[:, :, :self.num_sinks, :]
@@ -588,26 +600,29 @@ class DualSpaceKVCache(DynamicCache):
 
                 k_mid = kl[:, :, mid_start:mid_end, :]
                 v_mid = vl[:, :, mid_start:mid_end, :]
-                u_mid = inverse_rope(k_mid, cos_mid, sin_mid)
+
+                mid_pos_l = torch.arange(mid_start, mid_end, device=dev_l)
+                cos_mid_l, sin_mid_l = compute_rope_cos_sin(mid_pos_l, D, self.rope_theta, dev_l, dtype_l)
+                u_mid = inverse_rope(k_mid, cos_mid_l, sin_mid_l)
 
                 ck_list, cv_list = [], []
                 for i in range(k_budget):
-                    s_idx = splits[i]
-                    e_idx = splits[i+1]
+                    s_idx = splits_cpu[i].item()
+                    e_idx = splits_cpu[i+1].item()
                     if e_idx <= s_idx:
                         continue
-                    idx_chunk = torch.arange(s_idx, e_idx, device=device)
+                    idx_chunk = torch.arange(s_idx, e_idx, device=dev_l)
                     c_u = u_mid[:, :, idx_chunk, :]
                     c_v = v_mid[:, :, idx_chunk, :]
-                    c_pos = mid_pos[idx_chunk].float()
+                    c_pos = mid_pos_l[idx_chunk].float()
 
                     u_bar = c_u.mean(dim=-2, keepdim=True)
                     v_bar = c_v.mean(dim=-2, keepdim=True)
                     p_bar = c_pos.mean()
 
-                    cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, device, dtype)
+                    cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, dev_l, dtype_l)
                     k_canon = apply_rope(u_bar, cos_p, sin_p)
-                    gamma = layer._get_coherence_factor(c_pos, p_bar, D, device, dtype)
+                    gamma = layer._get_coherence_factor(c_pos, p_bar, D, dev_l, dtype_l)
                     k_bar = gamma * k_canon
 
                     ck_list.append(k_bar)
