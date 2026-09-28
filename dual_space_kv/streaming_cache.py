@@ -52,7 +52,7 @@ class DualSpaceCacheLayer:
         num_recent: int = 32,
         rope_theta: float = 1000000.0,
         mode: str = "adaptive",
-        salience_ratio: float = 0.25
+        salience_ratio: float = 0.35
     ):
         self.layer_idx = layer_idx
         self.window_size = window_size
@@ -191,7 +191,7 @@ class DualSpaceCacheLayer:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Updates the cache with new incoming key and value states.
-        Handles prompt prefilling with windowed compression and autoregressive decoding.
+        Handles prompt prefilling with sequence-wide adaptive compression and autoregressive decoding.
         """
         B, H, seq_len, D = key_states.shape
         device = key_states.device
@@ -219,34 +219,118 @@ class DualSpaceCacheLayer:
             M = mid_k.shape[-2]
             mid_pos = torch.arange(self.num_sinks, self.num_sinks + M, device=device)
 
-            # Vectorized canonical De-RoPE for all middle keys
-            cos_mid, sin_mid = compute_rope_cos_sin(mid_pos, D, self.rope_theta, device, dtype)
-            u_mid = inverse_rope(mid_k, cos_mid, sin_mid)
-
-            # Process temporal windows
-            num_windows = (M + self.window_size - 1) // self.window_size
-            cent_k_list, cent_v_list = [], []
-            for w in range(num_windows):
-                w_s = w * self.window_size
-                w_e = min(M, (w + 1) * self.window_size)
-                w_u = u_mid[:, :, w_s:w_e, :]
-                w_k = mid_k[:, :, w_s:w_e, :]
-                w_v = mid_v[:, :, w_s:w_e, :]
-                w_pos = mid_pos[w_s:w_e]
+            k_budget = max(1, M // self.target_compression)
+            if k_budget >= M:
+                self.centroids_k = mid_k
+                self.centroids_v = mid_v
+            else:
+                # Vectorized canonical De-RoPE for all middle keys
+                cos_mid, sin_mid = compute_rope_cos_sin(mid_pos, D, self.rope_theta, device, dtype)
+                u_mid = inverse_rope(mid_k, cos_mid, sin_mid)
 
                 if self.mode == "adaptive":
-                    ck, cv = self._compress_window_adaptive(w_u, w_k, w_v, w_pos, D, device, dtype)
-                else:
-                    ck, cv = self._compress_window_chunk(w_u, w_v, w_pos, D, device, dtype)
-                cent_k_list.append(ck)
-                cent_v_list.append(cv)
+                    # Two-Tier Adaptive Allocation:
+                    # Dynamically allocate exact anchor budget across sequence based on local U-space salience
+                    num_anchors = max(1, int(k_budget * self.salience_ratio))
+                    num_centroids = max(1, k_budget - num_anchors)
 
-            self.centroids_k = torch.cat(cent_k_list, dim=-2)
-            self.centroids_v = torch.cat(cent_v_list, dim=-2)
+                    # Compute local window salience across temporal windows in U-space
+                    num_windows = (M + self.window_size - 1) // self.window_size
+                    salience = torch.zeros(M, device=device, dtype=torch.float32)
+                    for w in range(num_windows):
+                        ws = w * self.window_size
+                        we = min(M, (w + 1) * self.window_size)
+                        wu = u_mid[:, :, ws:we, :]
+                        u_n = wu / (wu.norm(dim=-1, keepdim=True) + 1e-8)
+                        sim = torch.matmul(u_n, u_n.transpose(-1, -2))
+                        sal = -sim.mean(dim=-1).mean(dim=1)[0]
+                        salience[ws:we] = sal
+
+                    # Select top salient anchors
+                    anchor_local_idx = torch.topk(salience, k=num_anchors).indices.sort().values
+                    anchor_set = set(anchor_local_idx.tolist())
+                    bg_local_idx = torch.tensor([i for i in range(M) if i not in anchor_set], device=device, dtype=torch.long)
+
+                    anchors_k = mid_k[:, :, anchor_local_idx, :]
+                    anchors_v = mid_v[:, :, anchor_local_idx, :]
+                    anchors_pos = mid_pos[anchor_local_idx].float()
+
+                    # Partition background context into num_centroids chunks
+                    splits = torch.linspace(0, len(bg_local_idx), steps=num_centroids + 1, device=device).long()
+                    ck_list, cv_list, cp_list = [], [], []
+                    for i in range(num_centroids):
+                        s_idx = splits[i]
+                        e_idx = splits[i+1]
+                        if e_idx <= s_idx:
+                            continue
+                        chunk = bg_local_idx[s_idx:e_idx]
+                        c_u = u_mid[:, :, chunk, :]
+                        c_v = mid_v[:, :, chunk, :]
+                        c_pos = mid_pos[chunk].float()
+
+                        u_bar = c_u.mean(dim=-2, keepdim=True)
+                        v_bar = c_v.mean(dim=-2, keepdim=True)
+                        p_bar = c_pos.mean()
+
+                        cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, device, dtype)
+                        k_canon = apply_rope(u_bar, cos_p, sin_p)
+                        gamma = self._get_coherence_factor(c_pos, p_bar, D, device, dtype)
+                        k_bar = gamma * k_canon
+
+                        ck_list.append(k_bar)
+                        cv_list.append(v_bar)
+                        cp_list.append(p_bar)
+
+                    if len(ck_list) > 0:
+                        cent_k = torch.cat(ck_list, dim=-2)
+                        cent_v = torch.cat(cv_list, dim=-2)
+                        cent_pos = torch.stack(cp_list)
+
+                        all_mid_k = torch.cat([anchors_k, cent_k], dim=-2)
+                        all_mid_v = torch.cat([anchors_v, cent_v], dim=-2)
+                        all_pos = torch.cat([anchors_pos, cent_pos])
+
+                        # Monotonic causal sorting by temporal position
+                        perm = torch.argsort(all_pos)
+                        self.centroids_k = all_mid_k[:, :, perm, :]
+                        self.centroids_v = all_mid_v[:, :, perm, :]
+                    else:
+                        self.centroids_k = anchors_k
+                        self.centroids_v = anchors_v
+                else:
+                    # Uniform Dirichlet Phase-Coherent Centroids
+                    splits = torch.linspace(0, M, steps=k_budget + 1, device=device).long()
+                    ck_list, cv_list = [], []
+                    for i in range(k_budget):
+                        s_idx = splits[i]
+                        e_idx = splits[i+1]
+                        if e_idx <= s_idx:
+                            continue
+                        idx_chunk = torch.arange(s_idx, e_idx, device=device)
+                        c_u = u_mid[:, :, idx_chunk, :]
+                        c_v = mid_v[:, :, idx_chunk, :]
+                        c_pos = mid_pos[idx_chunk].float()
+
+                        u_bar = c_u.mean(dim=-2, keepdim=True)
+                        v_bar = c_v.mean(dim=-2, keepdim=True)
+                        p_bar = c_pos.mean()
+
+                        cos_p, sin_p = compute_rope_cos_sin(p_bar.unsqueeze(0), D, self.rope_theta, device, dtype)
+                        k_canon = apply_rope(u_bar, cos_p, sin_p)
+                        gamma = self._get_coherence_factor(c_pos, p_bar, D, device, dtype)
+                        k_bar = gamma * k_canon
+
+                        ck_list.append(k_bar)
+                        cv_list.append(v_bar)
+
+                    self.centroids_k = torch.cat(ck_list, dim=-2)
+                    self.centroids_v = torch.cat(cv_list, dim=-2)
 
             self.keys = torch.cat([self.sinks_k, self.centroids_k, self.recent_k], dim=-2)
             self.values = torch.cat([self.sinks_v, self.centroids_v, self.recent_v], dim=-2)
-            return self.keys, self.values
+            # Return uncompressed key/value states for exact prompt self-attention during prefill,
+            # while storing the compressed states in self.keys/self.values for subsequent autoregressive decoding.
+            return key_states, value_states
         else:
             # Autoregressive Decode Phase (typically seq_len == 1)
             if self.recent_k is None:
@@ -305,7 +389,7 @@ class DualSpaceKVCache(DynamicCache):
         num_recent: int = 32,
         rope_theta: Optional[float] = None,
         mode: str = "adaptive",
-        salience_ratio: float = 0.25
+        salience_ratio: float = 0.35
     ):
         super().__init__()
         self.window_size = window_size

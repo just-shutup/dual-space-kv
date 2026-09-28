@@ -16,17 +16,15 @@ def run_local_benchmark():
     model.eval()
     print(f"Model loaded in {time.time() - t0:.2f}s")
     
-    # Construct a realistic test prompt
-    prompt = (
-        "Artificial intelligence systems rely on efficient inference algorithms to serve billions of users worldwide. "
-        "The Key-Value (KV) cache is essential for avoiding quadratic recomputation in autoregressive Transformer decoders. "
-        "However, as context lengths scale to tens of thousands of tokens, GPU memory requirements grow linearly. "
-        "The administrative server secret access passcode is 849204. Please store this key securely. "
-        "Standard eviction methods prune middle context tokens, leading to factual hallucinations. "
-        "Windowed Dual-Space Centroid KV solves Rotary Position Embedding phase cancellation via canonical U-space projection."
+    # Construct a realistic test prompt with background context and needle
+    filler = (
+        "The development of distributed computer systems involves complex architectural trade-offs between latency and throughput. "
+        "Engineers must carefully design memory hierarchies, network protocols, and synchronization mechanisms. "
+        "Modern database engines implement write-ahead logging and multi-version concurrency control to ensure ACID guarantees. "
     )
+    needle = "The administrative server secret access passcode is 849204. Please store this key securely. "
     query = "\n\nWhat is the administrative server secret access passcode? The passcode is"
-    full_text = prompt + query
+    full_text = (filler * 4) + needle + (filler * 4) + query
     
     inputs = tokenizer(full_text, return_tensors="pt")
     prompt_len = inputs["input_ids"].shape[1]
@@ -36,26 +34,51 @@ def run_local_benchmark():
     print("\n[1/2] Running Baseline Model (Exact Full Cache)...")
     t_base = time.time()
     with torch.no_grad():
-        out_base = model.generate(**inputs, max_new_tokens=6, do_sample=False)
-    gen_base = repr(tokenizer.decode(out_base[0][prompt_len:]))
+        res_base = model(inputs["input_ids"], use_cache=True)
+    base_cache = res_base.past_key_values
+    
+    curr_in = inputs["input_ids"][:, -1:]
+    gen_ids_base = []
+    for s in range(6):
+        with torch.no_grad():
+            out = model(curr_in, past_key_values=base_cache, use_cache=True, position_ids=torch.tensor([[prompt_len + s]]))
+            next_tok = torch.argmax(out.logits[0, -1]).item()
+            gen_ids_base.append(next_tok)
+            curr_in = torch.tensor([[next_tok]])
+    gen_base = repr(tokenizer.decode(gen_ids_base))
     base_time = time.time() - t_base
     print(f"  -> Generated: {gen_base} ({base_time:.2f}s)")
     
     # 2. Windowed Dual-Space PyTorch Cache
-    print("\n[2/2] Running Windowed Dual-Space Cache (Window=16, 4x Target Compression)...")
+    print("\n[2/2] Running Windowed Dual-Space Cache (Target Budget: 64 tokens)...")
+    budget = 64
+    sinks = 4
+    recent = 16
+    mid_budget = budget - sinks - recent
+    target_comp = max(1, (prompt_len - sinks - recent) // mid_budget)
+
+    t_ds = time.time()
     cache = DualSpaceKVCache(
         config=model.config,
-        window_size=16,
-        target_compression=4,
-        num_sinks=4,
-        num_recent=16,
-        mode="adaptive"
+        window_size=32,
+        target_compression=target_comp,
+        num_sinks=sinks,
+        num_recent=recent,
+        mode="adaptive",
+        salience_ratio=0.35
     )
+    for l in range(len(base_cache.layers)):
+        cache.update(base_cache.layers[l].keys, base_cache.layers[l].values, l)
     
-    t_ds = time.time()
-    with torch.no_grad():
-        out_ds = model.generate(**inputs, past_key_values=cache, max_new_tokens=6, do_sample=False)
-    gen_ds = repr(tokenizer.decode(out_ds[0][prompt_len:]))
+    curr_in = inputs["input_ids"][:, -1:]
+    gen_ids_ds = []
+    for s in range(6):
+        with torch.no_grad():
+            out = model(curr_in, past_key_values=cache, use_cache=True, position_ids=torch.tensor([[prompt_len + s]]))
+            next_tok = torch.argmax(out.logits[0, -1]).item()
+            gen_ids_ds.append(next_tok)
+            curr_in = torch.tensor([[next_tok]])
+    gen_ds = repr(tokenizer.decode(gen_ids_ds))
     ds_time = time.time() - t_ds
     print(f"  -> Generated: {gen_ds} ({ds_time:.2f}s)")
     
